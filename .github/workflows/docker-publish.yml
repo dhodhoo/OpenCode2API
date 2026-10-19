@@ -8,7 +8,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: tiarabasori/opencode2api
+  # Owner-derived so a fork publishes to its own namespace instead of trying to
+  # push into the upstream one (which GITHUB_TOKEN cannot do). metadata-action
+  # lowercases the resulting image name.
+  IMAGE_NAME: ${{ github.repository_owner }}/opencode2api
 
 jobs:
   build-and-push:

@@ -55,6 +55,39 @@ docker run -d \
   my-opencode2api
 ```
 
+## ☁️ Railway
+
+The published image runs unchanged as a Railway service.
+
+1. **New Project → Deploy from Docker Image** →
+   `ghcr.io/tiarabasori/opencode2api:latest`, or your own fork's image
+   (`ghcr.io/<owner>/opencode2api:latest`) once its publish workflow has run.
+2. **Variables**:
+   - `API_KEY=...` and `OPENCODE_SERVER_PASSWORD=...` (the URL is public)
+   - `OPENCODE_DISABLE_TOOLS=true`
+   - optional: `OPENCODE_WEB_PANEL_ENABLED=true`, `OPENCODE_METRICS_ENABLED=true`
+   - optional pool: `OPENCODE_PROXY_POOL='[{"name":"direct","type":"direct"},{"name":"relay","type":"relay","url":"https://relay-xxxx.up.railway.app"}]'`
+   - do **not** set `OPENCODE_PROXY_PORT`: Railway injects `PORT` and the proxy
+     listens on it (`OPENCODE_PROXY_PORT` would win and break routing).
+3. **Settings → Networking → Generate Domain**, target port = the injected `PORT`.
+4. Optional **volume** at `/home/node/.local/share/opencode` to keep OpenCode
+   auth and session storage across deploys.
+5. Health check path: `/health`.
+
+Building your own image from a fork: enable GitHub Actions for the fork, merge
+your branch into `main`, and the workflow publishes
+`ghcr.io/<owner>/opencode2api:latest`. Make the package public (Package settings
+→ Change visibility) or give Railway registry credentials before pulling.
+
+**Relay on Railway**: deploy `relay/railway` as a second service from the same
+repo (root directory `relay/railway`, builder Dockerfile) — see
+[`relay/railway/README.md`](../../relay/railway/README.md). Then add its URL as
+a `relay` pool entry. A relay in the same project/region shares the proxy's
+egress IPs, so it adds failover but not IP rotation.
+
+**Memory**: one `opencode serve` backend needs roughly 0.7–1 GB; a pool with N
+entries runs N backends inside the same container.
+
 ## 📊 Log Management
 
 ```bash

@@ -4,7 +4,7 @@ The proxy pool can send upstream traffic through an HTTP relay instead of the
 host network. A relay is a tiny forwarder you deploy to an edge platform, so
 OpenCode Zen sees the platform's egress IP rather than yours.
 
-Four ready-to-deploy templates live in this directory:
+Five ready-to-deploy templates live in this directory:
 
 | Platform | Entry point | Deploy |
 |---|---|---|
@@ -12,6 +12,7 @@ Four ready-to-deploy templates live in this directory:
 | Cloudflare Workers | `cloudflare/src/index.js` | `wrangler deploy` in `relay/cloudflare` |
 | Netlify | `netlify/netlify/functions/relay.mjs` | `netlify deploy --prod` in `relay/netlify` |
 | Deno Deploy | `deno/main.ts` | `deployctl deploy --project=... deno/main.ts` |
+| Railway | `railway/server.mjs` | GitHub repo → root directory `relay/railway` (see [`railway/README.md`](./railway/README.md)) |
 
 ## How it works
 
