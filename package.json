@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "NODE_OPTIONS=--experimental-vm-modules jest tests/unit --runInBand --detectOpenHandles",
-    "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest tests/unit --runInBand --detectOpenHandles",
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js tests/unit --runInBand --detectOpenHandles",
+    "test:unit": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js tests/unit --runInBand --detectOpenHandles",
     "test:integration": "bash tests/integration/test-integration.sh",
     "test:stream": "bash tests/manual/test-streaming-real.sh"
   },
