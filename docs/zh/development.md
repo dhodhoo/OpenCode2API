@@ -42,7 +42,9 @@ OpenCode2API/
 ├── index.js                  # 入口与配置加载
 ├── src/
 │   ├── proxy.js              # 核心代理逻辑
+│   ├── pool/                 # 代理池（条目解析 / 调度 / 健康探测）
 │   └── tool-runtime/         # 工具桥接运行时（contracts/parser/policy/registry/router/validator）
+├── relay/                    # 可部署的 relay 模板（Vercel/Cloudflare/Netlify/Deno）
 ├── tests/
 │   ├── unit/                 # Jest 单元测试（npm test）
 │   ├── integration/          # Docker 集成测试

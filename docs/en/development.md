@@ -42,7 +42,9 @@ OpenCode2API/
 ├── index.js                  # Entry and config loading
 ├── src/
 │   ├── proxy.js              # Core proxy logic
+│   ├── pool/                 # Proxy pool (entries/scheduler/health probes)
 │   └── tool-runtime/         # Tool bridge runtime (contracts/parser/policy/registry/router/validator)
+├── relay/                    # Deployable relay templates (Vercel/Cloudflare/Netlify/Deno)
 ├── tests/
 │   ├── unit/                 # Jest unit tests (npm test)
 │   ├── integration/          # Docker-backed integration tests

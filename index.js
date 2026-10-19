@@ -77,7 +77,12 @@ const defaultConfig = {
     // easy to lose depending on how the process was started; they can now also
     // live in config.json so every launch path picks them up.
     EVENT_IDLE_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 0,
-    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 0
+    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 0,
+    // Proxy pool: one backend instance per entry, each with its own egress
+    // path (direct / relay / HTTP proxy). Empty or unset = single backend.
+    POOL: undefined,
+    POOL_STRATEGY: process.env.OPENCODE_PROXY_POOL_STRATEGY || 'round-robin',
+    POOL_FAILURE_COOLDOWN_MS: parseInt(process.env.OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS) || 0
 };
 
 // Load config from file
@@ -117,13 +122,23 @@ const finalConfig = {
     DEBUG: parseBool(process.env.OPENCODE_PROXY_DEBUG, parseBool(fileConfig.DEBUG, false)),
     ZEN_API_KEY: process.env.OPENCODE_ZEN_API_KEY || fileConfig.ZEN_API_KEY || '',
     OMIT_SYSTEM_PROMPT: parseBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT, parseBool(fileConfig.OMIT_SYSTEM_PROMPT, defaultConfig.OMIT_SYSTEM_PROMPT)),
+    // Previously read only by startProxy from the environment, which silently
+    // ignored config.json. The pool pins conversations to a backend through
+    // this setting, so the file path has to work.
+    CHAT_SESSION_AFFINITY: parseBool(process.env.OPENCODE_CHAT_SESSION_AFFINITY, parseBool(fileConfig.CHAT_SESSION_AFFINITY, false)),
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, parseBool(fileConfig.AUTO_CLEANUP_CONVERSATIONS, defaultConfig.AUTO_CLEANUP_CONVERSATIONS)),
     CLEANUP_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || fileConfig.CLEANUP_INTERVAL_MS || defaultConfig.CLEANUP_INTERVAL_MS,
     CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || fileConfig.CLEANUP_MAX_AGE_MS || defaultConfig.CLEANUP_MAX_AGE_MS,
     WEB_PANEL_ENABLED: parseBool(process.env.OPENCODE_WEB_PANEL_ENABLED, parseBool(fileConfig.WEB_PANEL_ENABLED, defaultConfig.WEB_PANEL_ENABLED)),
     // undefined => keep the library default (8000 / 30000)
     EVENT_IDLE_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || parseInt(fileConfig.EVENT_IDLE_TIMEOUT_MS) || undefined,
-    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || parseInt(fileConfig.EVENT_FIRST_DELTA_TIMEOUT_MS) || undefined
+    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || parseInt(fileConfig.EVENT_FIRST_DELTA_TIMEOUT_MS) || undefined,
+    // env (JSON array) > config.json (array). Parsed/validated in startProxy so
+    // a malformed entry aborts startup with a clear message.
+    POOL: process.env.OPENCODE_PROXY_POOL !== undefined ? process.env.OPENCODE_PROXY_POOL : fileConfig.POOL,
+    POOL_STRATEGY: process.env.OPENCODE_PROXY_POOL_STRATEGY || fileConfig.POOL_STRATEGY || defaultConfig.POOL_STRATEGY,
+    POOL_FAILURE_COOLDOWN_MS: parseInt(process.env.OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS) || parseInt(fileConfig.POOL_FAILURE_COOLDOWN_MS) || undefined,
+    POOL_HEALTH_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_POOL_HEALTH_INTERVAL_MS) || parseInt(fileConfig.POOL_HEALTH_INTERVAL_MS) || undefined
 };
 
 // Validate required configuration
@@ -186,6 +201,7 @@ console.log(`  - Cleanup Interval: ${finalConfig.CLEANUP_INTERVAL_MS}ms`);
 console.log(`  - Cleanup Max Age: ${finalConfig.CLEANUP_MAX_AGE_MS}ms`);
 console.log(`  - Event Idle Timeout: ${finalConfig.EVENT_IDLE_TIMEOUT_MS || 'default (8000)'}ms`);
 console.log(`  - Event First Delta Timeout: ${finalConfig.EVENT_FIRST_DELTA_TIMEOUT_MS || 'default (30000)'}ms`);
+console.log(`  - Proxy Pool: ${Array.isArray(finalConfig.POOL) && finalConfig.POOL.length ? `${finalConfig.POOL.length} entr${finalConfig.POOL.length === 1 ? 'y' : 'ies'} (${finalConfig.POOL_STRATEGY})` : 'disabled (single backend)'}`);
 console.log(`  - Debug: ${finalConfig.DEBUG ? 'Yes' : 'No'}`);
 
 // A rejected promise inside a request handler must not take the whole proxy down.

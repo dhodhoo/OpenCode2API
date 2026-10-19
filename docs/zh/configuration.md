@@ -52,6 +52,15 @@
 | `OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS` | - | `30000` | 流式响应首个 delta 的超时 |
 | `OPENCODE2API_EVENT_IDLE_TIMEOUT_MS` | - | `8000` | 流式响应的空闲超时 |
 
+### 代理池
+
+| 环境变量 | config.json | 默认值 | 说明 |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_PROXY_POOL` | `POOL` | (空) | 后端条目 JSON 数组；每个条目拥有独立的 `opencode serve` 实例与出口路径。为空时保持单后端模式 |
+| `OPENCODE_PROXY_POOL_STRATEGY` | `POOL_STRATEGY` | `round-robin` | 选择策略：`round-robin` 或 `least-connections` |
+| `OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS` | `POOL_FAILURE_COOLDOWN_MS` | `30000` | 探测失败或后端启动失败后的基础冷却时间（按连续失败次数倍增，最多 6 倍） |
+| `OPENCODE_PROXY_POOL_HEALTH_INTERVAL_MS` | `POOL_HEALTH_INTERVAL_MS` | `30000` | relay/proxy 条目的探测间隔 |
+
 ## 📄 config.json 示例
 
 ```json
@@ -73,9 +82,60 @@
     "REQUEST_TIMEOUT_MS": 180000,
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
-    "OPENCODE_PATH": "opencode"
+    "OPENCODE_PATH": "opencode",
+    "POOL": [
+        { "name": "direct", "type": "direct" },
+        { "name": "vercel", "type": "relay", "url": "https://relay-xxxx.vercel.app" },
+        { "name": "jkt", "type": "proxy", "url": "http://user:pass@10.0.0.1:8080" }
+    ],
+    "POOL_STRATEGY": "round-robin"
 }
 ```
+
+## 🧩 代理池
+
+每个池条目把一个 `opencode serve` 实例与一条出口路径绑定：
+
+| `type` | 出口 | 后端配置 |
+|:--|:--|:--|
+| `direct` | 主机网络 | 无 |
+| `relay` | 边缘部署 | 把 provider 的 `baseURL` 改写为 relay 地址 |
+| `proxy` | HTTP(S) 代理 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` |
+
+端口以 `OPENCODE_SERVER_URL` 为基准：第 0 个条目用 10001，第 1 个用 10002，依此类推。
+请求按策略分发；开启 `CHAT_SESSION_AFFINITY` 时同一会话固定在拥有该会话的实例上，
+`previous_response_id` 链式调用同理。
+
+### relay 条目
+
+边缘平台无法转发 TLS（`CONNECT`），因此 relay 是一个小型转发器：它接收请求并自行调用
+OpenCode Zen。Vercel、Cloudflare Workers、Netlify、Deno Deploy 的可部署模板在
+[`relay/`](../../relay/README.md)，均提供 `/health` 并按路径分流
+（`/messages` → Anthropic 兼容、`:generateContent` → Google、其余 → OpenAI 兼容）。
+
+```json
+{ "name": "vercel", "type": "relay", "url": "https://relay-xxxx.vercel.app" }
+```
+
+代理会把 `provider.opencode.options.baseURL` 写入后端的 `OPENCODE_CONFIG_CONTENT`，
+该配置对所有 Zen 模型生效（opencode 只追加协议路径）。若 relay 配置了
+`RELAY_TOKEN`，后端也必须发送该请求头，可通过自定义 `OPENCODE_CONFIG_CONTENT` 的
+provider headers 添加。
+
+### proxy 条目
+
+支持 `http://user:pass@host:port` 或裸写的 `user:pass@host:port`。只支持 HTTP(S)
+代理；凭据中的特殊字符需要百分号编码。
+
+### 健康检查
+
+relay 与 proxy 条目按 `POOL_HEALTH_INTERVAL_MS` 探测：relay 只要返回任意 HTTP 响应即视为
+可达，proxy 使用 TCP 连接。探测失败或后端无法启动会把该条目标记为不健康，冷却时间为
+`POOL_FAILURE_COOLDOWN_MS × 连续失败次数`（最多 6 倍）。上游 API 错误（例如 Zen key 过期）
+**不会** 把出口路径标记为不健康，因为它与 relay/代理本身无关。
+
+`/health/details`、`/metrics`（`opencode_pool_backend_*`）与 `/panel/data.json`
+都会暴露每个条目的状态。
 
 ## 🛠️ 工具控制详解
 

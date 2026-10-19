@@ -52,6 +52,15 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 | `OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS` | - | `30000` | First-delta timeout for streaming |
 | `OPENCODE2API_EVENT_IDLE_TIMEOUT_MS` | - | `8000` | Idle timeout for streaming |
 
+### Proxy Pool
+
+| Env var | config.json | Default | Description |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_PROXY_POOL` | `POOL` | (empty) | JSON array of backend entries; each entry gets its own `opencode serve` instance and egress path. Empty keeps single-backend mode |
+| `OPENCODE_PROXY_POOL_STRATEGY` | `POOL_STRATEGY` | `round-robin` | Selection strategy: `round-robin` or `least-connections` |
+| `OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS` | `POOL_FAILURE_COOLDOWN_MS` | `30000` | Base cooldown after a failed probe or failed backend start (multiplied by consecutive failures, capped at 6×) |
+| `OPENCODE_PROXY_POOL_HEALTH_INTERVAL_MS` | `POOL_HEALTH_INTERVAL_MS` | `30000` | How often relay/proxy entries are probed |
+
 ## 📄 config.json Example
 
 ```json
@@ -73,9 +82,67 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
     "REQUEST_TIMEOUT_MS": 180000,
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
-    "OPENCODE_PATH": "opencode"
+    "OPENCODE_PATH": "opencode",
+    "POOL": [
+        { "name": "direct", "type": "direct" },
+        { "name": "vercel", "type": "relay", "url": "https://relay-xxxx.vercel.app" },
+        { "name": "jkt", "type": "proxy", "url": "http://user:pass@10.0.0.1:8080" }
+    ],
+    "POOL_STRATEGY": "round-robin"
 }
 ```
+
+## 🧩 Proxy Pool
+
+A pool entry pairs one `opencode serve` instance with one egress path:
+
+| `type` | Egress | Backend configuration |
+|:--|:--|:--|
+| `direct` | host network | none |
+| `relay` | the edge deployment | provider `baseURL` is rewritten to the relay |
+| `proxy` | the HTTP(S) proxy | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` |
+
+Ports follow `OPENCODE_SERVER_URL`: entry 0 uses 10001, entry 1 uses 10002, and
+so on. Requests are distributed by the configured strategy; a conversation with
+`CHAT_SESSION_AFFINITY` stays on the instance that owns its session, and
+`previous_response_id` chains do the same.
+
+### Relay entries
+
+Edge platforms cannot tunnel TLS (`CONNECT`), so a relay is a small forwarder
+that receives the request and calls OpenCode Zen itself. Deployable templates
+for Vercel, Cloudflare Workers, Netlify and Deno Deploy live in
+[`relay/`](../../relay/README.md); each answers `/health` and routes by request
+path (`/messages` → Anthropic-compatible, `:generateContent` → Google,
+everything else → OpenAI-compatible).
+
+```json
+{ "name": "vercel", "type": "relay", "url": "https://relay-xxxx.vercel.app" }
+```
+
+The proxy sets `provider.opencode.options.baseURL` in the backend's
+`OPENCODE_CONFIG_CONTENT`, which applies to every Zen model (opencode appends
+only the protocol path). `RELAY_TOKEN`, when configured on the relay, must also
+be sent by the backend; put it in the provider headers via a custom
+`OPENCODE_CONFIG_CONTENT` if you need it.
+
+### Proxy entries
+
+`http://user:pass@host:port`, or the bare `user:pass@host:port` form. Only
+HTTP(S) proxies work — the backend process speaks the standard proxy protocol.
+Credentials must be percent-encoded.
+
+### Health
+
+Relay and proxy entries are probed on `POOL_HEALTH_INTERVAL_MS` (any HTTP
+response from the relay counts as reachable; a TCP connect for proxies). A
+failed probe or a backend that cannot start marks the entry unhealthy for
+`POOL_FAILURE_COOLDOWN_MS × consecutive failures` (capped at 6×). Upstream API
+errors — an expired Zen key, for example — do **not** mark a path unhealthy,
+because they say nothing about the relay or proxy.
+
+`/health/details`, `/metrics` (`opencode_pool_backend_*`) and `/panel/data.json`
+expose the per-entry state.
 
 ## 🛠️ Tool Control Details
 

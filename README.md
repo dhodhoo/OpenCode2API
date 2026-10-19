@@ -20,6 +20,7 @@
 - **可观测性** — `/health/details` 结构化诊断，`/metrics` Prometheus 指标
 - **Web Panel** — 可选内置面板（`/panel`），只读展示状态/模型/诊断，默认关闭
 - **Docker 部署** — 一键启动，自动拉起 OpenCode 后端
+- **代理池** — 多后端并行，每个后端拥有独立出口（直连、Vercel/Cloudflare/Netlify/Deno relay 或 HTTP 代理）；支持轮询/最少连接、健康探测，会话固定在拥有它的后端实例上
 
 ## 🚀 快速开始
 

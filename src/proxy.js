@@ -3,6 +3,7 @@ import cors from 'cors';
 import bodyParser from 'body-parser';
 import { spawn } from 'child_process';
 import crypto from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import http from 'http';
 import https from 'https';
@@ -15,6 +16,9 @@ import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtim
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
 import { PANEL_CSP, PANEL_HTML } from './panel-page.js';
+import { parsePoolEntries, buildEntryBackendEnv } from './pool/entries.js';
+import { createPoolScheduler } from './pool/scheduler.js';
+import { startPoolHealthProbes } from './pool/health.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
@@ -874,7 +878,119 @@ export function createApp(config) {
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
     const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
-    const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
+
+    // --- Proxy pool -------------------------------------------------------
+    // Each entry owns one backend instance and one egress path (direct, relay
+    // or HTTP proxy). With no entries configured the proxy keeps its exact
+    // single-backend behavior.
+    const poolEntries = Array.isArray(config.POOL) ? config.POOL : [];
+    const poolEnabled = poolEntries.length > 0;
+    const scheduler = poolEnabled
+        ? createPoolScheduler(poolEntries, {
+            strategy: config.POOL_STRATEGY,
+            failureCooldownMs: config.POOL_FAILURE_COOLDOWN_MS
+        })
+        : null;
+    const entryClients = new Map();
+    const clientForEntry = (entry) => {
+        if (!entryClients.has(entry.id)) {
+            entryClients.set(entry.id, createOpencodeClient({ baseUrl: entry.serverUrl, headers: clientHeaders }));
+        }
+        return entryClients.get(entry.id);
+    };
+    const defaultEntry = poolEnabled ? poolEntries[0] : null;
+    const defaultClient = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
+
+    // The backend for a request is chosen once, then every SDK call in that
+    // request (session create/prompt/messages/events) must reach the same
+    // instance. AsyncLocalStorage carries the choice through the helpers
+    // without threading a client argument through each call site.
+    const backendScope = new AsyncLocalStorage();
+    const activeEntry = () => backendScope.getStore()?.entry || defaultEntry;
+    const setActiveEntry = (entry) => {
+        const store = backendScope.getStore();
+        if (store) store.entry = entry;
+        return entry;
+    };
+    const client = new Proxy({}, {
+        get(_target, prop) {
+            // Never look like a thenable: awaiting the proxy would recurse.
+            if (prop === 'then') return undefined;
+            const entry = activeEntry();
+            const target = entry ? clientForEntry(entry) : defaultClient;
+            const value = target[prop];
+            return typeof value === 'function' ? value.bind(target) : value;
+        }
+    });
+
+    // Picks the backend for a request, preferring the instance that already
+    // owns the conversation (affinity). Returns null when the pool is off.
+    const chooseEntry = (affinityId = null) => {
+        if (!scheduler) return null;
+        const entry = scheduler.select({ affinityId });
+        if (entry) setActiveEntry(entry);
+        return entry;
+    };
+    // Every entry cooling down after failures is a real outage: answer 503
+    // instead of silently falling back to the un-pooled backend URL, which has
+    // no egress configuration.
+    const rejectIfPoolExhausted = (res) => {
+        if (!poolEnabled) return false;
+        res.status(503).json({
+            error: {
+                message: 'No eligible backend in the proxy pool; every entry is cooling down after failures',
+                type: 'service_unavailable'
+            }
+        });
+        return true;
+    };
+    // Reserves the entry for the duration of the response. Only a successful
+    // response clears a failure state: an upstream 5xx (expired key, model
+    // error) says nothing about the egress path, and a dead path is detected by
+    // the reachability probes instead.
+    const trackBackendRequest = (entry, res) => {
+        if (!entry || !scheduler) return;
+        scheduler.acquire(entry);
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            scheduler.release(entry);
+        };
+        res.once('finish', () => {
+            if (res.statusCode < 500) scheduler.markSuccess(entry);
+            release();
+        });
+        res.once('close', release);
+    };
+
+    // Starts (or reuses) the entry's backend and marks the entry unhealthy when
+    // the instance cannot come up.
+    const ensureBackendFor = async (entry) => {
+        try {
+            await ensureBackend(config, entry);
+        } catch (error) {
+            if (entry && scheduler) scheduler.markFailure(entry, error);
+            throw error;
+        }
+    };
+
+    if (scheduler) {
+        startPoolHealthProbes({
+            entries: poolEntries,
+            scheduler,
+            intervalMs: config.POOL_HEALTH_INTERVAL_MS,
+            logger: console
+        });
+    }
+
+    app.use((req, res, next) => backendScope.run({ entry: null }, next));
+
+    // Read-only view for /health/details, /metrics and the panel.
+    const poolSnapshot = () => (scheduler
+        ? { strategy: scheduler.strategy, entries: scheduler.snapshot() }
+        : null);
+
 
     // Extract and validate the Bearer token from a request, if any.
     const extractBearerToken = (req) => {
@@ -1043,11 +1159,12 @@ export function createApp(config) {
         }
         return state;
     };
-    const storeResponseState = (responseId, sessionId, model) => {
+    const storeResponseState = (responseId, sessionId, model, backendId = null) => {
         if (!responseId || !sessionId) return;
         responseState.set(responseId, {
             sessionId,
             model,
+            backendId,
             expiresAt: Date.now() + RESPONSE_STATE_TTL_MS
         });
     };
@@ -1533,7 +1650,7 @@ export function createApp(config) {
             }
         }
     };
-    const chatSessionEntryStore = (signal, sessionId, userTurns, systemWithGuard, toolPolicy, toolOverrides, model) => {
+    const chatSessionEntryStore = (signal, sessionId, userTurns, systemWithGuard, toolPolicy, toolOverrides, model, backendId = null) => {
         chatSessions.set(signal, {
             signal,
             sessionId,
@@ -1542,6 +1659,7 @@ export function createApp(config) {
             toolPolicy,
             toolOverridesJson: JSON.stringify(toolOverrides ?? null),
             model,
+            backendId,
             pending: true,
             expiresAt: Date.now() + CHAT_SESSION_TTL_MS
         });
@@ -2213,8 +2331,18 @@ export function createApp(config) {
                         resultingMode: internalToolContext.resultingMode
                     });
 
+                    // Proxy pool: pin the conversation to the backend that served its
+                    // previous turn (session state lives in that instance), otherwise
+                    // let the scheduler pick the next eligible entry.
+                    const poolSignal = CHAT_SESSION_AFFINITY ? chatSessionSignalOf(req, req.body) : null;
+                    const poolAffinity = poolSignal ? chatSessions.get(poolSignal) : null;
+                    const backendEntry = chooseEntry(poolAffinity?.backendId || null);
+                    if (poolEnabled && !backendEntry) return rejectIfPoolExhausted(res);
+                    const backendEntryId = backendEntry?.id || null;
+                    trackBackendRequest(backendEntry, res);
+
                     // Ensure backend is running
-                    await ensureBackend(config);
+                    await ensureBackendFor(backendEntry);
 
                     // Set active model
                     try {
@@ -2250,7 +2378,10 @@ export function createApp(config) {
                                 && entry.model === `${pID}/${mID}`
                                 && entry.system === (systemWithGuard || '')
                                 && entry.toolPolicy === toolControl.title
-                                && entry.toolOverridesJson === JSON.stringify(toolControl.toolOverrides ?? null)) {
+                                && entry.toolOverridesJson === JSON.stringify(toolControl.toolOverrides ?? null)
+                                // The session lives in one backend instance; a different
+                                // entry means a fresh session even when the prompt matches.
+                                && (entry.backendId || null) === backendEntryId) {
                                 const turns = chatUserTurnsOf(parts);
                                 if (turns && turns.length > entry.userTurns.length
                                     && entry.userTurns.every((t, i) => t === turns[i])) {
@@ -2276,7 +2407,7 @@ export function createApp(config) {
                                 const turns = chatUserTurnsOf(parts);
                                 if (turns) {
                                     affinitySignal = signal;
-                                    chatSessionEntryStore(signal, sessionId, turns, systemWithGuard, toolControl.title, toolControl.toolOverrides, `${pID}/${mID}`);
+                                    chatSessionEntryStore(signal, sessionId, turns, systemWithGuard, toolControl.title, toolControl.toolOverrides, `${pID}/${mID}`, backendEntryId);
                                 }
                             }
                         }
@@ -3042,7 +3173,10 @@ export function createApp(config) {
                         toolMode
                     });
 
-                    await ensureBackend(config);
+                    const backendEntry = chooseEntry(null);
+                    if (poolEnabled && !backendEntry) return rejectIfPoolExhausted(res);
+                    trackBackendRequest(backendEntry, res);
+                    await ensureBackendFor(backendEntry);
                     try {
                         await client.config.update({
                             body: { activeModel: { providerID: pID, modelID: mID } }
@@ -3681,6 +3815,8 @@ export function createApp(config) {
                 models: [],
                 health: null
             };
+            const pool = poolSnapshot();
+            if (pool) payload.pool = pool;
             try {
                 payload.models = buildModelsList(await getProvidersList());
             } catch (e) {
@@ -3740,6 +3876,8 @@ export function createApp(config) {
                 }
             }
         };
+        const pool = poolSnapshot();
+        if (pool) diagnostics.pool = pool;
         // Per-key usage only appears in multi-user mode so single-key
         // deployments keep their exact legacy snapshot shape. Admin callers see
         // every key; a user key only sees its own row; unauthenticated
@@ -3787,6 +3925,29 @@ export function createApp(config) {
             '# TYPE opencode_internal_tool_cache_ids gauge',
             `opencode_internal_tool_cache_ids ${cachedToolIds ? cachedToolIds.length : 0}`
         ];
+
+        // Backend pool: one series per entry. `status` is 1 while the entry is
+        // eligible (healthy, or still inside its failure cooldown).
+        const pool = poolSnapshot();
+        if (pool) {
+            metricsLines.push(
+                '# HELP opencode_pool_backend_status Backend pool entry eligibility (1 = eligible, 0 = cooling down).',
+                '# TYPE opencode_pool_backend_status gauge',
+                '# HELP opencode_pool_backend_inflight In-flight requests per backend pool entry.',
+                '# TYPE opencode_pool_backend_inflight gauge',
+                '# HELP opencode_pool_backend_requests_total Requests routed to each backend pool entry.',
+                '# TYPE opencode_pool_backend_requests_total counter',
+                '# HELP opencode_pool_backend_failures_total Failed requests per backend pool entry.',
+                '# TYPE opencode_pool_backend_failures_total counter'
+            );
+            for (const entry of pool.entries) {
+                const labels = `name="${escapePrometheusLabel(entry.name)}",type="${escapePrometheusLabel(entry.type)}"`;
+                metricsLines.push(`opencode_pool_backend_status{${labels}} ${entry.eligible ? 1 : 0}`);
+                metricsLines.push(`opencode_pool_backend_inflight{${labels}} ${entry.inFlight}`);
+                metricsLines.push(`opencode_pool_backend_requests_total{${labels}} ${entry.totalRequests}`);
+                metricsLines.push(`opencode_pool_backend_failures_total{${labels}} ${entry.totalFailures}`);
+            }
+        }
 
         // Per-key usage counters, only when multi-user keys are configured.
         // Scoped the same way as /health/details: admin sees all keys, a user
@@ -3999,7 +4160,14 @@ export function createApp(config) {
             const pID = resolvedModel.providerID;
             const mID = resolvedModel.modelID;
 
-            await ensureBackend(config);
+            // Responses chaining (previous_response_id) must reach the backend
+            // that owns the session; a fresh response may land anywhere.
+            const backendEntry = chooseEntry(previousState?.backendId || null);
+            if (poolEnabled && !backendEntry) return rejectIfPoolExhausted(res);
+            const backendEntryId = backendEntry?.id || null;
+            trackBackendRequest(backendEntry, res);
+
+            await ensureBackendFor(backendEntry);
 
             try {
                 await client.config.update({
@@ -4012,7 +4180,13 @@ export function createApp(config) {
             // With the tool-lock plugin, a chained session keeps the policy it was
             // created with, so toolControl.title only matters for new sessions.
             const toolControl = await resolveToolControl(toolMode, internalToolContext);
-            let sessionId = previousState?.sessionId || null;
+            // A session only exists inside the backend that created it, so a
+            // chained response that landed on another entry starts fresh.
+            const reusableSessionId = previousState
+                && (previousState.backendId || null) === backendEntryId
+                ? previousState.sessionId
+                : null;
+            let sessionId = reusableSessionId;
             if (!sessionId) {
                 sessionId = await createSession(toolControl);
             }
@@ -4418,7 +4592,7 @@ export function createApp(config) {
                 };
                 emit({ type: 'response.completed', sequence_number: nextSeq(), response });
                 res.write('data: [DONE]\n\n');
-                storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+                storeResponseState(responseId, sessionId, `${pID}/${mID}`, backendEntryId);
                 return res.end();
             }
 
@@ -4497,7 +4671,7 @@ export function createApp(config) {
                 }
             };
 
-            storeResponseState(responseId, sessionId, `${pID}/${mID}`);
+            storeResponseState(responseId, sessionId, `${pID}/${mID}`, backendEntryId);
 
             return res.json(response);
         } catch (error) {
@@ -4557,8 +4731,13 @@ export function buildBackendConfigContent(existing = process.env.OPENCODE_CONFIG
 
 /**
  * Backend Lifecycle Management
+ *
+ * `entry` is a proxy-pool entry (see src/pool/entries.js). Without one the
+ * function behaves exactly as before: a single backend at
+ * OPENCODE_SERVER_URL. With one, the backend listens on the entry's port and
+ * inherits its egress configuration (relay baseURL or HTTP proxy env).
  */
-async function ensureBackend(config) {
+async function ensureBackend(config, entry = null) {
     const {
         OPENCODE_SERVER_URL,
         OPENCODE_PATH,
@@ -4567,7 +4746,8 @@ async function ensureBackend(config) {
         OPENCODE_SERVER_PASSWORD,
         MANAGE_BACKEND
     } = config;
-    const stateKey = OPENCODE_SERVER_URL;
+    const serverUrl = entry?.serverUrl || OPENCODE_SERVER_URL;
+    const stateKey = serverUrl;
 
     if (!backendState.has(stateKey)) {
         backendState.set(stateKey, {
@@ -4584,7 +4764,7 @@ async function ensureBackend(config) {
         for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
             await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
             try {
-                await checkHealth(OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD);
+                await checkHealth(serverUrl, OPENCODE_SERVER_PASSWORD);
                 return;
             } catch (e) { }
         }
@@ -4592,13 +4772,13 @@ async function ensureBackend(config) {
     }
 
     try {
-        await checkHealth(OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD);
+        await checkHealth(serverUrl, OPENCODE_SERVER_PASSWORD);
     } catch (err) {
         if (!MANAGE_BACKEND) {
             for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
                 await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
                 try {
-                    await checkHealth(OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD);
+                    await checkHealth(serverUrl, OPENCODE_SERVER_PASSWORD);
                     return;
                 } catch (e) { }
             }
@@ -4606,7 +4786,7 @@ async function ensureBackend(config) {
         }
 
         state.isStarting = true;
-        console.log(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
+        console.log(`[Proxy] OpenCode backend not found at ${serverUrl}. Starting...`);
 
         // Kill existing process if any
         if (state.process) {
@@ -4625,10 +4805,19 @@ async function ensureBackend(config) {
         // The tool-lock plugin keeps Zen free models usable (see plugin/), the
         // server password protects the backend API, and the Zen key unlocks
         // paid models. `opencode serve` reads all three from the environment.
+        // Pool entries add their egress path on top: a relay rewrites the
+        // provider baseURL inside OPENCODE_CONFIG_CONTENT, a proxy entry sets
+        // HTTP_PROXY/HTTPS_PROXY for the backend process.
+        const configContent = buildBackendConfigContent();
+        const entryEnv = buildEntryBackendEnv(entry, {
+            ...process.env,
+            OPENCODE_CONFIG_CONTENT: configContent
+        });
         const backendEnv = {
-            OPENCODE_CONFIG_CONTENT: buildBackendConfigContent(),
+            OPENCODE_CONFIG_CONTENT: configContent,
             ...(OPENCODE_SERVER_PASSWORD ? { OPENCODE_SERVER_PASSWORD } : {}),
-            ...(ZEN_API_KEY ? { OPENCODE_API_KEY: ZEN_API_KEY } : {})
+            ...(ZEN_API_KEY ? { OPENCODE_API_KEY: ZEN_API_KEY } : {}),
+            ...entryEnv
         };
 
         const isWindows = process.platform === 'win32';
@@ -4695,7 +4884,7 @@ async function ensureBackend(config) {
             }
         }
 
-        const [, , portStr] = OPENCODE_SERVER_URL.split(':');
+        const [, , portStr] = serverUrl.split(':');
         const port = portStr ? portStr.split('/')[0] : '10001';
         const resolved = resolveOpencodePath(OPENCODE_PATH);
         const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
@@ -4732,7 +4921,7 @@ async function ensureBackend(config) {
         for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
             await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
             try {
-                await checkHealth(OPENCODE_SERVER_URL, OPENCODE_SERVER_PASSWORD);
+                await checkHealth(serverUrl, OPENCODE_SERVER_PASSWORD);
                 console.log('[Proxy] OpenCode backend ready.');
                 started = true;
                 break;
@@ -4829,12 +5018,39 @@ export function startProxy(options) {
         EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS
     };
 
+    // Parse the pool before the app is built: a malformed entry must fail at
+    // startup, not on the first request. An empty pool keeps single-backend
+    // behavior byte-for-byte.
+    config.POOL = parsePoolEntries(
+        options.POOL !== undefined ? options.POOL : process.env.OPENCODE_PROXY_POOL,
+        { baseServerUrl: config.OPENCODE_SERVER_URL }
+    );
+    config.POOL_STRATEGY = options.POOL_STRATEGY || process.env.OPENCODE_PROXY_POOL_STRATEGY || 'round-robin';
+    const poolCooldownMs = Number(options.POOL_FAILURE_COOLDOWN_MS || process.env.OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS);
+    config.POOL_FAILURE_COOLDOWN_MS = Number.isFinite(poolCooldownMs) && poolCooldownMs > 0 ? poolCooldownMs : undefined;
+    const poolHealthMs = Number(options.POOL_HEALTH_INTERVAL_MS || process.env.OPENCODE_PROXY_POOL_HEALTH_INTERVAL_MS);
+    config.POOL_HEALTH_INTERVAL_MS = Number.isFinite(poolHealthMs) && poolHealthMs > 0 ? poolHealthMs : undefined;
+    if (config.POOL.length > 0) {
+        console.log(`[Pool] ${config.POOL.length} backend(s): ${config.POOL.map((entry) => `${entry.name}(${entry.type})`).join(', ')} strategy=${config.POOL_STRATEGY}`);
+    }
+
     const { app } = createApp(config);
     
     const server = app.listen(config.PORT, config.BIND_HOST, async () => {
         console.log(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
         try {
-            await ensureBackend(config);
+            if (config.POOL.length === 0) {
+                await ensureBackend(config);
+            } else {
+                const results = await Promise.allSettled(
+                    config.POOL.map((entry) => ensureBackend(config, entry))
+                );
+                results.forEach((result, index) => {
+                    if (result.status === 'rejected') {
+                        console.error(`[Pool] Backend ${config.POOL[index].name} warmup failed:`, result.reason?.message || result.reason);
+                    }
+                });
+            }
         } catch (error) {
             console.error('[Proxy] Backend warmup failed:', error.message);
         }
@@ -4842,16 +5058,20 @@ export function startProxy(options) {
 
     return {
         server,
+        pool: config.POOL.length > 0 ? config.POOL : null,
         killBackend: () => {
-            const state = backendState.get(config.OPENCODE_SERVER_URL);
-            if (state && state.process) {
-                state.process.kill();
-            }
-            // Cleanup temp dir (only on non-Windows where we use jail)
-            if (state && state.jailRoot && process.platform !== 'win32') {
-                try {
-                    fs.rmSync(state.jailRoot, { recursive: true, force: true });
-                } catch (e) { }
+            const entries = config.POOL.length > 0 ? config.POOL : [null];
+            for (const entry of entries) {
+                const state = backendState.get(entry ? entry.serverUrl : config.OPENCODE_SERVER_URL);
+                if (state && state.process) {
+                    state.process.kill();
+                }
+                // Cleanup temp dir (only on non-Windows where we use jail)
+                if (state && state.jailRoot && process.platform !== 'win32') {
+                    try {
+                        fs.rmSync(state.jailRoot, { recursive: true, force: true });
+                    } catch (e) { }
+                }
             }
         }
     };

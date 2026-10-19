@@ -20,6 +20,7 @@ Turns a local [OpenCode](https://opencode.ai) runtime into an OpenAI-compatible 
 - **Observability** — `/health/details` structured diagnostics, `/metrics` Prometheus metrics
 - **Web Panel** — optional built-in dashboard at `/panel` (read-only status/models/diagnostics), off by default
 - **Docker deployment** — one command starts the stack and the OpenCode backend
+- **Proxy pool** — run several backends, each with its own egress path (direct, Vercel/Cloudflare/Netlify/Deno relay, or HTTP proxy); round-robin or least-connections, health-probed, with conversations pinned to the backend that owns their session
 
 ## 🚀 Quick Start
 

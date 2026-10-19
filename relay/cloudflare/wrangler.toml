@@ -1,0 +1,9 @@
+name = "opencode2api-relay"
+main = "src/index.js"
+compatibility_date = "2024-03-20"
+
+[vars]
+RELAY_OPENAI_BASE = "https://opencode.ai/inference/openai/v1"
+RELAY_ANTHROPIC_BASE = "https://opencode.ai/inference/anthropic/v1"
+RELAY_GOOGLE_BASE = "https://opencode.ai/inference/google/v1beta"
+# RELAY_TOKEN = "change-me"
