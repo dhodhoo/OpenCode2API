@@ -57,6 +57,10 @@ docker run -d \
 
 ## ☁️ Railway
 
+Ready-to-use files: `railway.json` at the repo root (Dockerfile builder,
+`/health` probe) and [`deploy/railway/`](../../deploy/railway/README.md)
+(variable template + step-by-step for the proxy and relay services).
+
 The published image runs unchanged as a Railway service.
 
 1. **New Project → Deploy from Docker Image** →

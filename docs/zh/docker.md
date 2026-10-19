@@ -57,6 +57,10 @@ docker run -d \
 
 ## ☁️ Railway
 
+开箱即用的文件：仓库根目录的 `railway.json`（Dockerfile 构建、`/health` 探测）以及
+[`deploy/railway/`](../../deploy/railway/README.md)（变量模板 + 代理与 relay 两个服务的
+分步说明）。
+
 已发布的镜像可以直接作为 Railway 服务运行。
 
 1. **New Project → Deploy from Docker Image** →

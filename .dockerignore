@@ -11,3 +11,6 @@ tests
 *.log
 .env
 .env.*
+# Deployment assets (proxy image does not need them; relay builds from its own dir)
+deploy
+relay

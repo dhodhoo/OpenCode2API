@@ -1,0 +1,35 @@
+# Railway — copy to the service's Variables tab.
+# Values here are examples; replace the secrets before deploying.
+
+# Required on any public domain.
+API_KEY=change-me
+OPENCODE_SERVER_PASSWORD=change-me-too
+
+# Tool policy: keep built-in tools off unless you have a reason.
+OPENCODE_DISABLE_TOOLS=true
+
+# Observability.
+OPENCODE_WEB_PANEL_ENABLED=true
+OPENCODE_METRICS_ENABLED=true
+
+# Session reuse across turns (recommended with a pool).
+OPENCODE_CHAT_SESSION_AFFINITY=true
+
+# Proxy pool: one backend per entry. Must stay on one line.
+# Entry 0 listens on :10001, entry 1 on :10002, and so on.
+OPENCODE_PROXY_POOL=[{"name":"direct","type":"direct"}]
+OPENCODE_PROXY_POOL_STRATEGY=round-robin
+
+# With a relay service deployed from relay/railway, use e.g.:
+# OPENCODE_PROXY_POOL=[{"name":"direct","type":"direct"},{"name":"railway","type":"relay","url":"https://relay-xxxx.up.railway.app"}]
+
+# Do NOT set OPENCODE_PROXY_PORT: Railway injects PORT and the proxy uses it.
+# Do NOT point OPENCODE_SERVER_URL at another Railway service: the backends
+# run inside this container.
+
+# Optional.
+# OPENCODE_ZEN_API_KEY=
+# OPENCODE_PROXY_DEBUG=false
+# OPENCODE_PROXY_REQUEST_TIMEOUT_MS=180000
+# OPENCODE_PROXY_POOL_FAILURE_COOLDOWN_MS=30000
+# OPENCODE_PROXY_POOL_HEALTH_INTERVAL_MS=30000
